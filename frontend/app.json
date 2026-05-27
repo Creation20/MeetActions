@@ -1,0 +1,80 @@
+{
+  "expo": {
+    "name": "MeetActions",
+    "slug": "meetactions",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "scheme": "meetactions",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#000000"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.meetactions.app",
+      "infoPlist": {
+        "NSMicrophoneUsageDescription": "Allow MeetActions to access your microphone to record meeting audio and provide real-time AI transcription.",
+        "NSCameraUsageDescription": "Allow MeetActions to access your camera to capture whiteboards and presentation slides during meetings.",
+        "NSPhotoLibraryUsageDescription": "Allow MeetActions to access your photos to upload presentation slides."
+      }
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0A0A0F"
+      },
+      "edgeToEdgeEnabled": true,
+      "package": "com.meetactions.app",
+      "permissions": [
+        "RECORD_AUDIO",
+        "CAMERA",
+        "READ_EXTERNAL_STORAGE",
+        "WRITE_EXTERNAL_STORAGE",
+        "NOTIFICATIONS"
+      ]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-router",
+      [
+        "expo-av",
+        {
+          "microphonePermission": "Allow MeetActions to access your microphone to record and analyze meeting audio."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow MeetActions to access your gallery for whiteboard photos.",
+          "cameraPermission": "Allow MeetActions to use your camera for capturing whiteboard data."
+        }
+      ],
+      "expo-notifications",
+      [
+        "expo-document-picker",
+        {
+          "iCloudContainerEnvironment": "Development"
+        }
+      ],
+      "expo-web-browser",
+      [
+        "expo-calendar",
+        {
+          "calendarPermission": "Allow MeetActions to access your calendar to sync meeting tasks.",
+          "remindersPermission": "Allow MeetActions to access your reminders for task notifications."
+        }
+      ],
+      "expo-mail-composer"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    }
+  }
+}

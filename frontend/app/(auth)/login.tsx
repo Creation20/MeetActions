@@ -11,6 +11,7 @@ import * as Google from 'expo-auth-session/providers/google';
 import { makeRedirectUri } from 'expo-auth-session';
 import { useTheme } from '../../src/context/ThemeContext';
 import { getLoginStyles } from '../../src/styles/login.styles';
+import { showError } from '../../src/utils/errors';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -44,7 +45,7 @@ export default function LoginScreen() {
       const res = await googleLoginUser(idToken, 'user@example.com', 'Google User');
       await signIn(res.token, res.user);
     } catch (error: any) {
-      Alert.alert('Login Failed', error.message);
+      showError(error, 'Sign-in failed', "We couldn't sign you in. Please check your details and try again.");
     } finally {
       setLoading(false);
     }
@@ -61,7 +62,7 @@ export default function LoginScreen() {
       const res = await loginUser(email, password);
       await signIn(res.token, res.user);
     } catch (error: any) {
-      Alert.alert('Login Failed', error.message);
+      showError(error, 'Sign-in failed', "We couldn't sign you in. Please check your details and try again.");
     } finally {
       setLoading(false);
     }

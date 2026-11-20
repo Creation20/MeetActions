@@ -1,13 +1,14 @@
 import { Response } from 'express';
 import { Project } from '../models/Project';
 import { AuthRequest } from '../middleware/auth.middleware';
+import { fail } from '../utils/respond';
 
 export const getProjects = async (req: AuthRequest, res: Response): Promise<void> => {
   try {
     const projects = await Project.find({ userId: req.userId as any }).sort({ name: 1 });
     res.status(200).json(projects);
   } catch (error) {
-    res.status(500).json({ message: 'Error fetching projects', error });
+    fail(res, 500, "We couldn't load your folders. Pull to refresh to try again.", error);
   }
 };
 
@@ -15,7 +16,7 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
   try {
     const { name, color } = req.body;
     if (!name) {
-      res.status(400).json({ message: 'Project name is required' });
+      res.status(400).json({ message: "Please give the folder a name." });
       return;
     }
 
@@ -28,7 +29,7 @@ export const createProject = async (req: AuthRequest, res: Response): Promise<vo
     const savedProject = await newProject.save();
     res.status(201).json(savedProject);
   } catch (error) {
-    res.status(500).json({ message: 'Error creating project', error });
+    fail(res, 500, "We couldn't create that folder. Please try again.", error);
   }
 };
 
@@ -38,7 +39,7 @@ export const deleteProject = async (req: AuthRequest, res: Response): Promise<vo
     const project = await Project.findOneAndDelete({ _id: id as any, userId: req.userId as any });
     
     if (!project) {
-      res.status(404).json({ message: 'Project not found' });
+      res.status(404).json({ message: "That folder is no longer available." });
       return;
     }
 
@@ -47,6 +48,6 @@ export const deleteProject = async (req: AuthRequest, res: Response): Promise<vo
 
     res.status(200).json({ message: 'Project deleted successfully' });
   } catch (error) {
-    res.status(500).json({ message: 'Error deleting project', error });
+    fail(res, 500, "We couldn't delete that folder. Please try again.", error);
   }
 };

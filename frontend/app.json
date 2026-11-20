@@ -6,17 +6,14 @@
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
-    "newArchEnabled": true,
     "scheme": "meetactions",
-    "splash": {
-      "image": "./assets/splash-icon.png",
-      "resizeMode": "contain",
-      "backgroundColor": "#000000"
-    },
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.meetactions.app",
       "infoPlist": {
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true
+        },
         "NSMicrophoneUsageDescription": "Allow MeetActions to access your microphone to record meeting audio and provide real-time AI transcription.",
         "NSCameraUsageDescription": "Allow MeetActions to access your camera to capture whiteboards and presentation slides during meetings.",
         "NSPhotoLibraryUsageDescription": "Allow MeetActions to access your photos to upload presentation slides."
@@ -27,7 +24,6 @@
         "foregroundImage": "./assets/adaptive-icon.png",
         "backgroundColor": "#0A0A0F"
       },
-      "edgeToEdgeEnabled": true,
       "package": "com.meetactions.app",
       "permissions": [
         "RECORD_AUDIO",

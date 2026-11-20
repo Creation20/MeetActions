@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { View, Text, TouchableOpacity, Animated, Alert, Dimensions, Platform, StyleSheet, TextInput, ActivityIndicator } from 'react-native';
+import { View, Text, TouchableOpacity, Animated, Alert, Dimensions, Platform, StyleSheet, TextInput, ActivityIndicator, ScrollView } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Feather } from '@expo/vector-icons';
 import { useRouter } from 'expo-router';
@@ -8,11 +8,24 @@ import { Colors } from '../src/constants/theme';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as DocumentPicker from 'expo-document-picker';
 import * as ImagePicker from 'expo-image-picker';
-import { API_BASE_URL } from '../src/services/api';
+import { API_BASE_URL, fetchTemplates, ExtractionTemplateInfo, startLiveSession, sendLiveChunk, stopLiveSession } from '../src/services/api';
 import { getRecordStyles } from '../src/styles/record.styles';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useAuth } from '../src/context/AuthContext';
 import { useTheme } from '../src/context/ThemeContext';
+import { Aurora } from '../src/components/Aurora';
+import * as Haptics from 'expo-haptics';
+import { showError } from '../src/utils/errors';
+
+// Map backend template ids to valid Feather icon names.
+const TEMPLATE_ICONS: Record<string, string> = {
+  Default: 'zap',
+  '1:1': 'users',
+  Sales: 'trending-up',
+  Standup: 'git-branch',
+  Interview: 'clipboard',
+  Lecture: 'book-open',
+};
 
 export default function RecordScreen() {
   const router = useRouter();
@@ -35,30 +48,34 @@ export default function RecordScreen() {
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const zenPulse = useRef(new Animated.Value(1)).current;
 
-  // Visualizer bars
-  const bars = useRef([...Array(12)].map(() => new Animated.Value(4))).current;
+  // Visualizer bars + live audio level (0..1) driven by real microphone metering
+  const bars = useRef([...Array(28)].map(() => new Animated.Value(4))).current;
+  const levelRef = useRef(0.35);
+  const tickRef = useRef(0);
 
   useEffect(() => {
-    let interval: any;
+    let waveInterval: any;
+    let secInterval: any;
     if (isRecording && !isPaused) {
-      interval = setInterval(() => {
-        setDuration((d) => d + 1);
-        bars.forEach(bar => {
-          Animated.spring(bar, {
-            toValue: Math.random() * 40 + 10,
-            useNativeDriver: false,
-          }).start();
+      // Accurate 1-second clock.
+      secInterval = setInterval(() => setDuration((d) => d + 1), 1000);
+      // Fast waveform driven by real mic level.
+      waveInterval = setInterval(() => {
+        const level = levelRef.current;
+        bars.forEach((bar, i) => {
+          // Center-weighted amplitude so the waveform blooms from the middle.
+          const centerBias = 1 - Math.abs(i - bars.length / 2) / (bars.length / 2);
+          const jitter = 0.55 + Math.random() * 0.45;
+          const target = 4 + level * 46 * (0.4 + centerBias * 0.6) * jitter;
+          Animated.spring(bar, { toValue: target, speed: 40, bounciness: 6, useNativeDriver: false }).start();
         });
-      }, 150);
+      }, 140);
     } else if (!isRecording) {
       bars.forEach(bar => {
-        Animated.spring(bar, {
-          toValue: 4,
-          useNativeDriver: false,
-        }).start();
+        Animated.spring(bar, { toValue: 4, useNativeDriver: false }).start();
       });
     }
-    return () => clearInterval(interval);
+    return () => { clearInterval(waveInterval); clearInterval(secInterval); };
   }, [isRecording, isPaused]);
 
   useEffect(() => {
@@ -156,8 +173,13 @@ export default function RecordScreen() {
       });
 
       const { recording: newRecording } = await Audio.Recording.createAsync(
-        Audio.RecordingOptionsPresets.HIGH_QUALITY,
+        { ...Audio.RecordingOptionsPresets.HIGH_QUALITY, isMeteringEnabled: true },
         (status) => {
+          // Drive the live waveform from real microphone level (always, regardless of tier).
+          if (status.canRecord && status.isRecording) {
+            const m = status.metering ?? -160;
+            levelRef.current = Math.max(0.04, Math.min(1, (m + 55) / 55));
+          }
           if (status.canRecord && status.isRecording && isPremium && isAutoAIEnabled) {
             const metering = status.metering || -160;
             if (metering < -45) {
@@ -303,11 +325,17 @@ export default function RecordScreen() {
   const [bookmarks, setBookmarks] = useState<{ type: string, time: number }[]>([]);
 
   const addBookmark = (type: string) => {
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
     setBookmarks(prev => [...prev, { type, time: duration }]);
   };
 
-  const [mode, setMode] = useState<'Default' | 'Lecture' | 'Stand-up' | 'Interview'>('Default');
+  const [mode, setMode] = useState<string>('Default');
+  const [templates, setTemplates] = useState<ExtractionTemplateInfo[]>([]);
   const [attachedPhoto, setAttachedPhoto] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetchTemplates().then(setTemplates).catch(() => {});
+  }, []);
 
   const pickImage = async () => {
     if (!isPremium) {
@@ -331,8 +359,9 @@ export default function RecordScreen() {
     if (!targetUri) return;
 
     try {
+      await AsyncStorage.removeItem('@last_upload_id'); // clear any stale id
       router.replace('/processing/pending');
-      
+
       const storedSettings = await AsyncStorage.getItem('user_settings');
       const settings = storedSettings ? JSON.parse(storedSettings) : { autoSummary: true };
       const autoGenerate = settings.autoSummary !== false;
@@ -372,13 +401,102 @@ export default function RecordScreen() {
       });
       
       if (!response.ok) throw new Error('Upload failed');
+      // Hand the real meeting id to the processing screen so it can poll real status.
+      const data = await response.json().catch(() => null);
+      if (data?.meeting?._id) {
+        await AsyncStorage.setItem('@last_upload_id', String(data.meeting._id));
+      }
     } catch (error) {
       console.error('Upload Error:', error);
       Alert.alert('Upload Failed', 'There was an error uploading the audio.');
     }
   };
 
+  // ─── #3 Live / streaming mode ───────────────────────────────────────────────
+  const [isLiveMode, setIsLiveMode] = useState(false);
+  const [liveTranscript, setLiveTranscript] = useState('');
+  const liveState = useRef({ active: false, meetingId: '', offset: 0, rec: null as Audio.Recording | null });
+  const CHUNK_MS = 15000; // rolling chunk length
+
+  const recordLiveChunk = async () => {
+    try {
+      const { recording: chunkRec } = await Audio.Recording.createAsync(
+        { ...Audio.RecordingOptionsPresets.HIGH_QUALITY, isMeteringEnabled: true },
+        (status) => {
+          if (status.canRecord && status.isRecording) {
+            const m = status.metering ?? -160;
+            levelRef.current = Math.max(0.04, Math.min(1, (m + 55) / 55));
+          }
+        },
+        200
+      );
+      liveState.current.rec = chunkRec;
+      await new Promise((r) => setTimeout(r, CHUNK_MS));
+
+      // Stop this chunk (whether we're continuing or finishing).
+      try { await chunkRec.stopAndUnloadAsync(); } catch {}
+      const uri = chunkRec.getURI();
+      liveState.current.rec = null;
+      if (!uri) return;
+
+      const offset = liveState.current.offset;
+      liveState.current.offset += CHUNK_MS / 1000;
+      try {
+        const { transcript } = await sendLiveChunk(liveState.current.meetingId, uri, offset);
+        if (transcript) setLiveTranscript(transcript);
+      } catch (e) {
+        console.warn('[Live] chunk upload failed', e);
+      }
+    } catch (e) {
+      console.warn('[Live] chunk record failed', e);
+    }
+  };
+
+  const startLive = async () => {
+    try {
+      await Audio.requestPermissionsAsync();
+      await Audio.setAudioModeAsync({ allowsRecordingIOS: true, playsInSilentModeIOS: true });
+      const title = `Live Session ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+      const { meetingId } = await startLiveSession(title, isPremium ? mode : 'Default');
+      liveState.current = { active: true, meetingId, offset: 0, rec: null };
+      setLiveTranscript('');
+      setDuration(0);
+      setIsRecording(true);
+
+      // Sequential rolling-chunk loop.
+      while (liveState.current.active) {
+        await recordLiveChunk();
+      }
+    } catch (e: any) {
+      showError(e, 'Live transcription unavailable', "We couldn't start live transcription. Please try again.");
+      liveState.current.active = false;
+      setIsRecording(false);
+    }
+  };
+
+  const stopLive = async () => {
+    liveState.current.active = false;
+    const { meetingId } = liveState.current;
+    if (liveState.current.rec) {
+      try { await liveState.current.rec.stopAndUnloadAsync(); } catch {}
+      liveState.current.rec = null;
+    }
+    setIsRecording(false);
+    try {
+      await stopLiveSession(meetingId, duration, isPremium ? mode : 'Default');
+    } catch (e) {
+      console.warn('[Live] stop failed', e);
+    }
+    router.replace(`/processing/${meetingId}`);
+  };
+
   const handleRecordToggle = () => {
+    Haptics.impactAsync(isRecording ? Haptics.ImpactFeedbackStyle.Heavy : Haptics.ImpactFeedbackStyle.Medium);
+    if (isLiveMode) {
+      if (isRecording) stopLive();
+      else startLive();
+      return;
+    }
     if (isRecording) {
       stopRecording();
     } else {
@@ -439,11 +557,8 @@ export default function RecordScreen() {
 
   return (
     <View style={[styles.container, { backgroundColor: themeColors.bg }]}>
-      <LinearGradient
-        colors={[themeColors.bg, themeColors.bgCard]}
-        style={StyleSheet.absoluteFill}
-      />
-      
+      <Aurora isDark={isDarkMode} variant="record" intensity={isRecording ? 1 : 0.7} />
+
       {isZenMode && isRecording && (
         <View style={[styles.zenContainer, { backgroundColor: isDarkMode ? '#000' : '#fff' }]}>
           <Animated.View style={[styles.zenPulse, { transform: [{ scale: zenPulse }], backgroundColor: isDarkMode ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.05)' }]} />
@@ -500,28 +615,70 @@ export default function RecordScreen() {
         {/* Main Recording Interface */}
         <View style={styles.centerContent}>
           {!isRecording && !recordedUri && (
-            <View style={styles.modeSelector}>
-              {(['Default', 'Lecture', 'Stand-up', 'Interview'] as const).map((m) => (
-                <TouchableOpacity 
-                  key={m} 
-                  onPress={() => {
-                    if (m === 'Default' || isPremium) {
-                      setMode(m);
-                    } else {
-                      router.push('/paywall');
-                    }
-                  }}
-                  style={[styles.modeBtn, mode === m && styles.modeBtnActive]}
-                >
-                  <Text style={[styles.modeBtnText, mode === m && styles.modeBtnTextActive]}>{m}{m !== 'Default' && !isPremium ? ' 🔒' : ''}</Text>
-                </TouchableOpacity>
-              ))}
-            </View>
+            <ScrollView
+              horizontal
+              showsHorizontalScrollIndicator={false}
+              style={{ flexGrow: 0, marginBottom: 36, maxHeight: 48 }}
+              contentContainerStyle={{ gap: 8, alignItems: 'center', paddingHorizontal: 20 }}
+            >
+              {(templates.length ? templates : [{ id: 'Default', label: 'General', icon: 'sparkles', description: '' }]).map((t) => {
+                const active = mode === t.id;
+                const locked = t.id !== 'Default' && !isPremium;
+                const icon = TEMPLATE_ICONS[t.id] || 'zap';
+                const inner = (
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, paddingHorizontal: 14, paddingVertical: 9 }}>
+                    <Feather name={(locked ? 'lock' : icon) as any} size={13} color={active ? '#fff' : themeColors.textMuted} />
+                    <Text style={{ fontSize: 12, fontWeight: '700', color: active ? '#fff' : themeColors.textSecondary }}>{t.label}</Text>
+                  </View>
+                );
+                return (
+                  <TouchableOpacity
+                    key={t.id}
+                    activeOpacity={0.85}
+                    onPress={() => { Haptics.selectionAsync(); if (t.id === 'Default' || isPremium) setMode(t.id); else router.push('/paywall'); }}
+                  >
+                    {active ? (
+                      <LinearGradient colors={['#0A84FF', '#5B54E8']} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={{ borderRadius: 14 }}>
+                        {inner}
+                      </LinearGradient>
+                    ) : (
+                      <View style={{ borderRadius: 14, backgroundColor: isDarkMode ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.04)' }}>{inner}</View>
+                    )}
+                  </TouchableOpacity>
+                );
+              })}
+            </ScrollView>
+          )}
+
+          {!isRecording && !recordedUri && (
+            <TouchableOpacity
+              onPress={() => { if (!isPremium) { router.push('/paywall'); return; } setIsLiveMode(!isLiveMode); }}
+              style={{ flexDirection: 'row', alignItems: 'center', alignSelf: 'center', gap: 8, marginTop: 14, paddingHorizontal: 16, paddingVertical: 8, borderRadius: 20, borderWidth: 1, borderColor: isLiveMode ? themeColors.danger : themeColors.border, backgroundColor: isLiveMode ? themeColors.danger + '15' : 'transparent' }}
+            >
+              <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: isLiveMode ? themeColors.danger : themeColors.textMuted }} />
+              <Text style={{ fontSize: 13, fontWeight: '800', color: isLiveMode ? themeColors.danger : themeColors.textSecondary }}>
+                {isLiveMode ? 'LIVE TRANSCRIPTION ON' : 'Live Transcription'}{!isPremium ? ' 🔒' : ''}
+              </Text>
+            </TouchableOpacity>
           )}
 
           <View style={styles.timerContainer}>
             <Text style={styles.timerText}>{formatTime(duration)}</Text>
           </View>
+
+          {isLiveMode && isRecording && (
+            <View style={{ maxHeight: 160, marginHorizontal: 20, marginBottom: 10, padding: 14, borderRadius: 16, backgroundColor: isDarkMode ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.03)', borderWidth: 1, borderColor: themeColors.border }}>
+              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+                <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: themeColors.danger }} />
+                <Text style={{ fontSize: 10, fontWeight: '800', color: themeColors.danger, letterSpacing: 0.5 }}>LIVE TRANSCRIPT</Text>
+              </View>
+              <ScrollView>
+                <Text style={{ fontSize: 13, lineHeight: 20, color: themeColors.textSecondary }}>
+                  {liveTranscript || 'Listening… your words will appear here every few seconds.'}
+                </Text>
+              </ScrollView>
+            </View>
+          )}
 
           <View style={styles.visualizerBox}>
             {bars.map((bar, i) => (
@@ -659,35 +816,39 @@ export default function RecordScreen() {
             </TouchableOpacity>
           )}
 
-          <View style={styles.recordActionWrap}>
+          <View style={[styles.recordActionWrap, { width: 140, height: 140 }]}>
+            {/* Concentric glow rings while recording */}
             {isRecording && (
-              <Animated.View 
-                style={[
-                  styles.outerPulse,
-                  { transform: [{ scale: pulseAnim }], opacity: 0.2, backgroundColor: themeColors.primary }
-                ]}
-              />
+              <>
+                <Animated.View
+                  style={{ position: 'absolute', width: 140, height: 140, borderRadius: 70, borderWidth: 1.5, borderColor: themeColors.danger, transform: [{ scale: pulseAnim }], opacity: 0.25 }}
+                />
+                <Animated.View
+                  style={{ position: 'absolute', width: 110, height: 110, borderRadius: 55, backgroundColor: themeColors.danger, transform: [{ scale: zenPulse }], opacity: 0.18 }}
+                />
+              </>
             )}
-            
+
             {recordedUri && !isRecording ? (
-              <TouchableOpacity style={styles.saveBtn} onPress={() => uploadAudio()}>
-                <LinearGradient
-                  colors={themeColors.gradientAccent as [string, string]}
-                  style={styles.saveGradient}
-                >
-                  <Feather name="check" size={32} color="#fff" />
+              <TouchableOpacity activeOpacity={0.85} style={styles.saveBtn} onPress={() => { Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium); uploadAudio(); }}>
+                <LinearGradient colors={themeColors.gradientAccent as [string, string]} style={styles.saveGradient}>
+                  <Feather name="check" size={34} color="#fff" />
                 </LinearGradient>
               </TouchableOpacity>
             ) : (
-              <TouchableOpacity 
-                style={[styles.recordMainBtn, isRecording && styles.recordMainBtnActive]} 
-                onPress={handleRecordToggle}
-              >
-                {isRecording ? (
-                  <View style={styles.stopIcon} />
-                ) : (
-                  <View style={[styles.recordIcon, { backgroundColor: isDarkMode ? Colors.danger : themeColors.primary }]} />
-                )}
+              <TouchableOpacity activeOpacity={0.85} onPress={handleRecordToggle}>
+                <LinearGradient
+                  colors={isRecording ? [themeColors.danger, '#C4302B'] : ['#0A84FF', '#5B54E8']}
+                  start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }}
+                  style={{ width: 92, height: 92, borderRadius: 46, alignItems: 'center', justifyContent: 'center', shadowColor: isRecording ? themeColors.danger : '#0A84FF', shadowOpacity: 0.5, shadowRadius: 18, shadowOffset: { width: 0, height: 8 } }}
+                >
+                  {/* inner ring to create a "record" bezel */}
+                  <View style={{ width: 78, height: 78, borderRadius: 39, borderWidth: 3, borderColor: 'rgba(255,255,255,0.35)', alignItems: 'center', justifyContent: 'center' }}>
+                    {isRecording
+                      ? <View style={{ width: 26, height: 26, borderRadius: 7, backgroundColor: '#fff' }} />
+                      : <View style={{ width: 28, height: 28, borderRadius: 14, backgroundColor: '#fff' }} />}
+                  </View>
+                </LinearGradient>
               </TouchableOpacity>
             )}
           </View>

@@ -16,9 +16,14 @@ import {
   shareMeeting,
   unshareMeeting,
   getProactiveInsights,
-  getMediaFile
+  getMediaFile,
+  sendRecap,
+  reprocessMeeting,
+  deleteTask
 } from '../controllers/meeting.controller';
+import { startLive, appendLiveChunk, stopLive } from '../controllers/live.controller';
 import { authMiddleware } from '../middleware/auth.middleware';
+import { requirePremium, attachEntitlement } from '../middleware/premium.middleware';
 
 const router = Router();
 
@@ -54,9 +59,16 @@ const upload = multer({
 // Routes
 router.get('/analytics', getAnalytics);
 router.get('/proactive-insights', getProactiveInsights);
+
+// #3 Live / streaming session routes (declared before '/:id' so they aren't shadowed).
+// Live transcription is a premium feature — gated server-side, not just in the UI.
+router.post('/live/start', requirePremium, startLive);
+router.post('/live/:id/chunk', requirePremium, upload.fields([{ name: 'audio', maxCount: 1 }]), appendLiveChunk);
+router.post('/live/:id/stop', requirePremium, stopLive);
+
 router.get('/media/:filename', getMediaFile);
-router.get('/search', searchMeetings); 
-router.post('/ask-global', askGlobal);
+router.get('/search', searchMeetings);
+router.post('/ask-global', requirePremium, askGlobal);
 router.get('/', getMeetings);
 router.get('/:id', getMeetingById);
 router.patch('/:id', updateMeeting);
@@ -66,10 +78,15 @@ router.post('/:id/translate', translateMeeting);
 router.post('/:id/ask', askMeeting);
 router.post('/:id/share', shareMeeting);
 router.post('/:id/unshare', unshareMeeting);
+router.post('/:id/recap', sendRecap);
+router.post('/:id/reprocess', reprocessMeeting);
 
-// POST endpoint requires the multipart/form-data field name to be 'audio' and 'image'
-router.post('/', upload.fields([{ name: 'audio', maxCount: 1 }, { name: 'image', maxCount: 1 }]), createMeeting);
+// POST endpoint requires the multipart/form-data field name to be 'audio' and 'image'.
+// Free users may upload; attachEntitlement lets createMeeting downgrade premium-only
+// options (custom modes, image context) rather than rejecting the whole recording.
+router.post('/', attachEntitlement, upload.fields([{ name: 'audio', maxCount: 1 }, { name: 'image', maxCount: 1 }]), createMeeting);
 
 router.patch('/:meetingId/tasks/:taskId', updateTaskStatus);
+router.delete('/:meetingId/tasks/:taskId', deleteTask);
 
 export default router;

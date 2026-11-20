@@ -18,6 +18,8 @@ export interface IMeeting extends Document {
   status: 'processing' | 'ready' | 'error';
   audioUrl?: string;
   transcript?: string;
+  diarized?: boolean;
+  liveMode?: boolean;
   summary?: string;
   decisions?: string[];
   tasks?: ITask[];
@@ -26,6 +28,9 @@ export interface IMeeting extends Document {
     sentiment: string;
     tone: string;
     conflictDetected: boolean;
+    speakingTime?: { speakerId: string; durationSec: number; percentage: number }[];
+    interruptionCount?: number;
+    pacingScore?: number; // words per minute average
   };
   followUp?: {
     title: string;
@@ -35,6 +40,11 @@ export interface IMeeting extends Document {
   notes?: string;
   sharedWith?: any[];
   projectId?: any;
+  chunks?: {
+    content: string;
+    embedding: number[];
+    index: number;
+  }[];
 }
 
 const TaskSchema = new Schema<ITask>({
@@ -67,6 +77,8 @@ const MeetingSchema = new Schema<IMeeting>(
     },
     audioUrl: { type: String },
     transcript: { type: String },
+    diarized: { type: Boolean, default: false },
+    liveMode: { type: Boolean, default: false },
     summary: { type: String },
     decisions: [{ type: String }],
     tasks: [TaskSchema],
@@ -74,7 +86,14 @@ const MeetingSchema = new Schema<IMeeting>(
     analysis: {
       sentiment: { type: String },
       tone: { type: String },
-      conflictDetected: { type: Boolean, default: false }
+      conflictDetected: { type: Boolean, default: false },
+      speakingTime: [{
+        speakerId: String,
+        durationSec: Number,
+        percentage: Number
+      }],
+      interruptionCount: { type: Number, default: 0 },
+      pacingScore: { type: Number, default: 0 }
     },
     followUp: {
       title: { type: String },
@@ -84,6 +103,11 @@ const MeetingSchema = new Schema<IMeeting>(
     notes: { type: String, default: '' },
     sharedWith: [{ type: Schema.Types.ObjectId, ref: 'User' }],
     projectId: { type: Schema.Types.ObjectId, ref: 'Project' },
+    chunks: [{
+      content: String,
+      embedding: [Number],
+      index: Number
+    }]
   },
   { timestamps: true }
 );

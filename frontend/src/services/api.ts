@@ -4,31 +4,23 @@ import Constants from 'expo-constants';
 
 // 🤖 Dynamic API Host Detection
 const getApiHost = () => {
-  if (process.env.EXPO_PUBLIC_API_URL) return process.env.EXPO_PUBLIC_API_URL;
-
-  // 1. Android Simulator
-  if (Platform.OS === 'android' && !Constants.isDevice) {
-    return 'http://10.0.2.2:5005';
+  if (__DEV__) {
+    // 🛠️ Development: Use local IP or Expo host
+    const debuggerHost = Constants.expoConfig?.hostUri || Constants.experienceUrl;
+    const localhost = debuggerHost?.split(':')[0] || '172.20.10.3';
+    
+    console.log(`[API] Development Mode: Using host ${localhost}`);
+    return `http://${localhost}:5005`;
   }
 
-  // 2. iOS Simulator
-  if (Platform.OS === 'ios' && !Constants.isDevice) {
-    return 'http://localhost:5005';
-  }
-
-  // 3. Real Device (Auto-detect Mac IP from Expo)
-  const debuggerHost = Constants.expoConfig?.hostUri;
-  if (debuggerHost) {
-    const ip = debuggerHost.split(':').shift();
-    return `http://${ip}:5005`;
-  }
-
-  // 4. Fallback (Update this only if auto-detection fails)
-  return 'http://172.20.10.3:5005';
+  // 🚀 Cloudflare Tunnel (Ultra-stable, no signup required)
+  return 'https://proof-hosted-template-chargers.trycloudflare.com';
 };
 
 export const API_HOST = getApiHost();
+console.log('App initialized with API_HOST:', API_HOST);
 export const API_BASE_URL = `${API_HOST}/api/meetings`;
+export const API_INTEL_URL = `${API_HOST}/api/intelligence`;
 
 const getAuthHeaders = async (isMultipart = false) => {
   const token = await AsyncStorage.getItem('@auth_token');
@@ -45,7 +37,7 @@ const getAuthHeaders = async (isMultipart = false) => {
 const authenticatedFetch = async (url: string, options: any = {}) => {
   const isMultipart = options.body instanceof FormData;
   const headers = await getAuthHeaders(isMultipart);
-  
+
   const response = await fetch(url, {
     ...options,
     headers: { ...headers, ...options.headers }
@@ -57,6 +49,25 @@ const authenticatedFetch = async (url: string, options: any = {}) => {
   }
 
   return response;
+};
+
+export interface ApiUser {
+  _id: string;
+  name: string;
+  email: string;
+  profilePicture?: string;
+  /** Server-owned entitlement. The client displays this; it never decides it. */
+  isPremium: boolean;
+  plan: 'free' | 'premium';
+  premiumUntil: string | null;
+}
+
+/** Re-syncs the signed-in user (and their entitlement) from the server. */
+export const fetchMe = async (): Promise<ApiUser> => {
+  const res = await authenticatedFetch(`${API_HOST}/api/auth/me`);
+  if (!res.ok) throw new Error('Failed to fetch profile');
+  const data = await res.json();
+  return data.user;
 };
 
 export interface ApiProject {
@@ -84,6 +95,8 @@ export interface ApiMeeting {
   status: 'processing' | 'ready' | 'error';
   audioUrl?: string;
   transcript?: string;
+  diarized?: boolean;
+  liveMode?: boolean;
   summary?: string;
   decisions?: string[];
   tasks?: ApiTask[];
@@ -92,6 +105,9 @@ export interface ApiMeeting {
     sentiment: 'positive' | 'neutral' | 'negative';
     tone: string;
     conflictDetected: boolean;
+    speakingTime?: { speakerId: string; durationSec: number; percentage: number }[];
+    interruptionCount?: number;
+    pacingScore?: number;
   };
   followUp?: {
     title: string;
@@ -231,6 +247,20 @@ export const updateTaskStatus = async (meetingId: string, taskId: string, status
   }
 };
 
+export const deleteTask = async (meetingId: string, taskId: string): Promise<ApiMeeting> => {
+  try {
+    const response = await authenticatedFetch(`${API_BASE_URL}/${meetingId}/tasks/${taskId}`, {
+      method: 'DELETE',
+    });
+    if (!response.ok) throw new Error('Failed to delete task.');
+    const data = await response.json();
+    return data.meeting;
+  } catch (error: any) {
+    if (error.message === 'SESSION_EXPIRED') throw error;
+    throw new Error('Connection error. Task was not deleted.');
+  }
+};
+
 export const updateMeeting = async (meetingId: string, updates: Partial<ApiMeeting>): Promise<void> => {
   try {
     const response = await authenticatedFetch(`${API_BASE_URL}/${meetingId}`, {
@@ -246,6 +276,17 @@ export const updateMeeting = async (meetingId: string, updates: Partial<ApiMeeti
 
 export const renameMeeting = async (meetingId: string, title: string): Promise<void> => {
   return updateMeeting(meetingId, { title });
+};
+
+// Re-run the AI pipeline for a meeting that errored (real reprocessing, not just a status flip).
+export const reprocessMeeting = async (meetingId: string): Promise<void> => {
+  try {
+    const response = await authenticatedFetch(`${API_BASE_URL}/${meetingId}/reprocess`, { method: 'POST' });
+    if (!response.ok) throw new Error('Failed to restart processing.');
+  } catch (error: any) {
+    if (error.message === 'SESSION_EXPIRED') throw error;
+    throw new Error('Connection error. Could not restart processing.');
+  }
 };
 
 export const deleteMeeting = async (meetingId: string): Promise<void> => {
@@ -288,7 +329,19 @@ export const translateMeeting = async (meetingId: string, language: string): Pro
   }
 };
 
-export const askMeeting = async (meetingId: string, question: string): Promise<string> => {
+// ─── Cited answers (#9) ───────────────────────────────────────────────────────
+export interface Citation {
+  quote: string;
+  timestamp?: string;      // [MM:SS] the quote came from, if available
+  meetingId: string;
+  meetingTitle: string;
+}
+export interface CitedAnswer {
+  answer: string;
+  citations: Citation[];
+}
+
+export const askMeeting = async (meetingId: string, question: string): Promise<CitedAnswer> => {
   try {
     const response = await authenticatedFetch(`${API_BASE_URL}/${meetingId}/ask`, {
       method: 'POST',
@@ -296,14 +349,14 @@ export const askMeeting = async (meetingId: string, question: string): Promise<s
     });
     if (!response.ok) throw new Error('Failed to get answer.');
     const data = await response.json();
-    return data.answer;
+    return { answer: data.answer, citations: data.citations || [] };
   } catch (error: any) {
     if (error.message === 'SESSION_EXPIRED') throw error;
     throw new Error('Connection error. Could not reach AI assistant.');
   }
 };
 
-export const askGlobal = async (question: string): Promise<string> => {
+export const askGlobal = async (question: string): Promise<CitedAnswer> => {
   try {
     const response = await authenticatedFetch(`${API_BASE_URL}/ask-global`, {
       method: 'POST',
@@ -311,11 +364,174 @@ export const askGlobal = async (question: string): Promise<string> => {
     });
     if (!response.ok) throw new Error('Global AI query failed.');
     const data = await response.json();
-    return data.answer;
+    return { answer: data.answer, citations: data.citations || [] };
   } catch (error: any) {
     if (error.message === 'SESSION_EXPIRED') throw error;
     throw new Error('Connection error. Could not reach AI hub.');
   }
+};
+
+// ─── Semantic search (#7) ─────────────────────────────────────────────────────
+export interface SemanticResult {
+  meetingId: string;
+  meetingTitle: string;
+  date: string;
+  snippet: string;
+  score: number;
+}
+export const semanticSearch = async (query: string): Promise<{ results: SemanticResult[]; semantic: boolean }> => {
+  try {
+    const response = await authenticatedFetch(`${API_INTEL_URL}/search?q=${encodeURIComponent(query)}`);
+    if (!response.ok) throw new Error('Semantic search failed.');
+    return await response.json();
+  } catch (error: any) {
+    if (error.message === 'SESSION_EXPIRED') throw error;
+    throw new Error('Cannot connect to the server for search.');
+  }
+};
+
+// ─── Extraction templates (#8) ────────────────────────────────────────────────
+export interface ExtractionTemplateInfo {
+  id: string;
+  label: string;
+  icon: string;
+  description: string;
+}
+export const fetchTemplates = async (): Promise<ExtractionTemplateInfo[]> => {
+  try {
+    const response = await authenticatedFetch(`${API_INTEL_URL}/templates`);
+    if (!response.ok) throw new Error('Failed to load templates.');
+    return await response.json();
+  } catch (error: any) {
+    if (error.message === 'SESSION_EXPIRED') throw error;
+    // Non-fatal: fall back to a built-in Default.
+    return [{ id: 'Default', label: 'General Meeting', icon: 'sparkles', description: 'Balanced analysis.' }];
+  }
+};
+
+// ─── Cross-meeting memory (#1) ────────────────────────────────────────────────
+export interface MemoryEntity {
+  name: string;
+  type: 'person' | 'project' | 'company' | 'concept';
+  mentionCount: number;
+  lastMentioned: string;
+}
+export interface EntityTimelineItem {
+  meetingId: string;
+  meetingTitle: string;
+  context: string;
+  date: string;
+}
+export interface Commitment {
+  taskId: string;
+  title: string;
+  owner: string;
+  priority: string;
+  meetingId: string;
+  meetingTitle: string;
+  meetingDate: string;
+  ageDays: number;
+  overdue: boolean;
+  dueDate?: string;
+  likelyResolved: boolean;
+  followUpNote: string;
+}
+export interface DecisionDrift {
+  topic: string;
+  earlier: string;
+  earlierMeeting: string;
+  later: string;
+  laterMeeting: string;
+  type: 'reversal' | 'change' | 'contradiction';
+}
+
+export const fetchEntities = async (): Promise<MemoryEntity[]> => {
+  const response = await authenticatedFetch(`${API_INTEL_URL}/memory/entities`);
+  if (!response.ok) throw new Error('Failed to load knowledge base.');
+  return await response.json();
+};
+
+export const fetchEntityTimeline = async (name: string): Promise<{ name: string; type: string; timeline: EntityTimelineItem[] }> => {
+  const response = await authenticatedFetch(`${API_INTEL_URL}/memory/entities/${encodeURIComponent(name)}`);
+  if (!response.ok) throw new Error('Failed to load timeline.');
+  return await response.json();
+};
+
+export const fetchCommitments = async (): Promise<{
+  commitments: Commitment[];
+  brokenPromises: Commitment[];
+  stats: { total: number; overdue: number; stale: number };
+}> => {
+  const response = await authenticatedFetch(`${API_INTEL_URL}/memory/commitments`);
+  if (!response.ok) throw new Error('Failed to load commitments.');
+  return await response.json();
+};
+
+export const fetchDecisionDrift = async (): Promise<{ drifts: DecisionDrift[]; analyzed: number }> => {
+  const response = await authenticatedFetch(`${API_INTEL_URL}/memory/drift`);
+  if (!response.ok) throw new Error('Failed to analyze decisions.');
+  return await response.json();
+};
+
+// ─── Pre-meeting briefing (#5) ────────────────────────────────────────────────
+export interface Briefing {
+  hasHistory: boolean;
+  title: string;
+  openItems: { title: string; owner?: string; priority: string; meetingTitle: string; meetingId: string }[];
+  lastMeeting: { id: string; title: string; date: string; summary?: string } | null;
+  talkingPoints: string[];
+}
+export const fetchBriefing = async (title: string): Promise<Briefing> => {
+  const response = await authenticatedFetch(`${API_INTEL_URL}/briefing?title=${encodeURIComponent(title)}`);
+  if (!response.ok) throw new Error('Failed to build briefing.');
+  return await response.json();
+};
+
+// ─── Recap distribution (#4) ──────────────────────────────────────────────────
+export const sendRecap = async (meetingId: string, emails: string[]): Promise<{
+  sent: boolean; emailConfigured: boolean; recipients: string[]; preview: string; message: string;
+}> => {
+  const response = await authenticatedFetch(`${API_BASE_URL}/${meetingId}/recap`, {
+    method: 'POST',
+    body: JSON.stringify({ emails }),
+  });
+  if (!response.ok) throw new Error('Failed to send recap.');
+  return await response.json();
+};
+
+// ─── Live / streaming mode (#3) ───────────────────────────────────────────────
+export const startLiveSession = async (title: string, mode = 'Default', projectId?: string): Promise<{ meetingId: string; title: string }> => {
+  const response = await authenticatedFetch(`${API_BASE_URL}/live/start`, {
+    method: 'POST',
+    body: JSON.stringify({ title, mode, projectId }),
+  });
+  if (!response.ok) throw new Error('Failed to start live session.');
+  return await response.json();
+};
+
+export const sendLiveChunk = async (meetingId: string, chunkUri: string, offsetSec: number): Promise<{ segment: string; transcript: string }> => {
+  const formData = new FormData();
+  formData.append('offsetSec', String(offsetSec));
+  formData.append('audio', {
+    uri: chunkUri,
+    name: `chunk-${offsetSec}.m4a`,
+    type: 'audio/m4a',
+  } as any);
+  const response = await authenticatedFetch(`${API_BASE_URL}/live/${meetingId}/chunk`, {
+    method: 'POST',
+    body: formData,
+  });
+  if (!response.ok) throw new Error('Failed to send live chunk.');
+  return await response.json();
+};
+
+export const stopLiveSession = async (meetingId: string, duration: number, mode = 'Default'): Promise<{ meetingId: string; status: string }> => {
+  const response = await authenticatedFetch(`${API_BASE_URL}/live/${meetingId}/stop`, {
+    method: 'POST',
+    body: JSON.stringify({ duration, mode }),
+  });
+  if (!response.ok) throw new Error('Failed to stop live session.');
+  return await response.json();
 };
 
 export const shareMeeting = async (meetingId: string, email: string): Promise<void> => {

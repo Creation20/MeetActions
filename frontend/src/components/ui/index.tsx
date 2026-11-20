@@ -75,22 +75,24 @@ interface GlassCardProps {
   children: React.ReactNode;
   style?: StyleProp<ViewStyle>;
   onPress?: () => void;
+  onLongPress?: () => void;
 }
 
-export const GlassCard: React.FC<GlassCardProps> = ({ children, style, onPress }) => {
+export const GlassCard: React.FC<GlassCardProps> = ({ children, style, onPress, onLongPress }) => {
   const { colors: themeColors, isDarkMode } = useTheme();
-  
+
   const cardStyle: ViewStyle = {
     backgroundColor: themeColors.bgCard,
     borderColor: themeColors.border,
     shadowColor: isDarkMode ? '#000' : '#888',
   };
 
-  if (onPress) {
+  if (onPress || onLongPress) {
     return (
-      <TouchableOpacity 
-        onPress={onPress} 
-        activeOpacity={0.85} 
+      <TouchableOpacity
+        onPress={onPress}
+        onLongPress={onLongPress}
+        activeOpacity={0.85}
         style={[styles.glassCard, cardStyle, style]}
       >
         {children}

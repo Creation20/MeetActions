@@ -1,12 +1,14 @@
 import React, { createContext, useContext, useState, useEffect } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useRouter, useSegments } from 'expo-router';
+import { fetchMe } from '../services/api';
 
 interface User {
   _id: string;
   name: string;
   email: string;
   profilePicture?: string;
+  isPremium?: boolean;
 }
 
 interface AuthContextData {
@@ -18,6 +20,7 @@ interface AuthContextData {
   signOut: () => Promise<void>;
   updateUser: (user: User) => void;
   setPremiumStatus: (status: boolean) => Promise<void>;
+  refreshEntitlement: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextData>({} as AuthContextData);
@@ -41,10 +44,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         if (storedToken && storedUser) {
           setToken(storedToken);
           setUser(JSON.parse(storedUser));
-        }
-
-        if (storedPremium) {
-          setIsPremium(storedPremium === 'true');
+          // The cached flag is only an offline hint so the UI doesn't flicker to
+          // "free" on launch. The server is the authority — refresh it below.
+          if (storedPremium) setIsPremium(storedPremium === 'true');
+          refreshEntitlement();
         }
       } catch (error) {
         console.error('Failed to load auth data', error);
@@ -54,6 +57,24 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
     loadStorageData();
   }, []);
+
+  /**
+   * Pulls entitlement from the server and caches it. Every paid feature is also
+   * enforced server-side, so a stale or tampered cache can't unlock anything —
+   * it would only misdraw a lock icon until this resolves.
+   */
+  const refreshEntitlement = async () => {
+    try {
+      const me = await fetchMe();
+      setUser(me);
+      setIsPremium(me.isPremium);
+      await AsyncStorage.setItem('@auth_user', JSON.stringify(me));
+      await AsyncStorage.setItem('@is_premium', me.isPremium ? 'true' : 'false');
+    } catch {
+      // Offline or expired session: keep the cached hint and let the API layer
+      // handle a real 401.
+    }
+  };
 
   useEffect(() => {
     if (loading) return;
@@ -75,8 +96,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     try {
       await AsyncStorage.setItem('@auth_token', newToken);
       await AsyncStorage.setItem('@auth_user', JSON.stringify(newUser));
+      // Login/register responses now carry the server's entitlement.
+      const premium = Boolean(newUser.isPremium);
+      await AsyncStorage.setItem('@is_premium', premium ? 'true' : 'false');
       setToken(newToken);
       setUser(newUser);
+      setIsPremium(premium);
     } catch (error) {
       console.error('Failed to sign in', error);
     }
@@ -100,6 +125,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     await AsyncStorage.setItem('@auth_user', JSON.stringify(updatedUser));
   };
 
+  /**
+   * Display-only. Setting this does NOT grant access to anything: every paid
+   * feature is gated server-side by the entitlement on the user record. Once a
+   * payment provider is wired up, the purchase should be verified on the server
+   * and this should be replaced by a call to refreshEntitlement().
+   */
   const setPremiumStatus = async (status: boolean) => {
     try {
       await AsyncStorage.setItem('@is_premium', status ? 'true' : 'false');
@@ -110,7 +141,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   };
 
   return (
-    <AuthContext.Provider value={{ user, token, isPremium, loading, signIn, signOut, updateUser, setPremiumStatus }}>
+    <AuthContext.Provider value={{ user, token, isPremium, loading, signIn, signOut, updateUser, setPremiumStatus, refreshEntitlement }}>
       {children}
     </AuthContext.Provider>
   );

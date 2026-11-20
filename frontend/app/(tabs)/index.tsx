@@ -11,13 +11,16 @@ import { LinearGradient } from 'expo-linear-gradient';
 import * as DocumentPicker from 'expo-document-picker';
 import * as Calendar from 'expo-calendar';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { fetchMeetings, ApiMeeting, fetchAnalytics, AnalyticsData, askGlobal, API_BASE_URL, fetchProactiveInsights, ProactiveInsights } from '../../src/services/api';
+import { fetchMeetings, ApiMeeting, fetchAnalytics, AnalyticsData, askGlobal, API_BASE_URL, fetchProactiveInsights, ProactiveInsights, fetchBriefing } from '../../src/services/api';
 import { getHomeStyles } from '../../src/styles/home.styles';
 import LottieView from 'lottie-react-native';
+import { Aurora } from '../../src/components/Aurora';
+import * as Haptics from 'expo-haptics';
+import { showError } from '../../src/utils/errors';
 
 export default function HomeScreen() {
   const router = useRouter();
-  const { user, signOut, isPremium } = useAuth();
+  const { user, isPremium } = useAuth();
   const { isDarkMode, isOffline, colors: themeColors } = useTheme();
   const styles = useMemo(() => getHomeStyles(isDarkMode), [isDarkMode]);
   
@@ -33,8 +36,8 @@ export default function HomeScreen() {
   const [hubAnswer, setHubAnswer] = useState<string | null>(null);
   const [isAskingHub, setIsAskingHub] = useState(false);
 
-  const loadData = async () => {
-    setIsLoading(true);
+  const loadData = async (isFirstLoad = false) => {
+    if (isFirstLoad) setIsLoading(true);
     try {
       const [meetingsData, analyticsData, proactiveData] = await Promise.all([
         fetchMeetings(),
@@ -77,6 +80,33 @@ export default function HomeScreen() {
     } catch (e) {}
   };
 
+  const [loadingBriefing, setLoadingBriefing] = useState(false);
+  const handleOpenBriefing = async () => {
+    if (!upcomingEvent?.title) return;
+    setLoadingBriefing(true);
+    try {
+      const b = await fetchBriefing(upcomingEvent.title);
+      if (!b.hasHistory) {
+        Alert.alert(upcomingEvent.title, "No related history found. This looks like a fresh topic — you're starting with a clean slate.");
+        return;
+      }
+      const points = b.talkingPoints.length ? '\n\n📌 Talking points:\n' + b.talkingPoints.map(p => `• ${p}`).join('\n') : '';
+      const open = b.openItems.length ? `\n\n⏳ ${b.openItems.length} open item(s) from last time:\n` + b.openItems.slice(0, 4).map(i => `• ${i.title}${i.owner ? ` (${i.owner})` : ''}`).join('\n') : '';
+      Alert.alert(
+        `Briefing · ${upcomingEvent.title}`,
+        `${b.lastMeeting?.summary ? b.lastMeeting.summary.slice(0, 220) + '…' : ''}${open}${points}`,
+        b.lastMeeting ? [
+          { text: 'Open last meeting', onPress: () => router.push(`/meeting/${b.lastMeeting!.id}`) },
+          { text: 'Done', style: 'cancel' },
+        ] : undefined
+      );
+    } catch (e: any) {
+      showError(e, 'Briefing unavailable', "We couldn't prepare your briefing. Please try again.");
+    } finally {
+      setLoadingBriefing(false);
+    }
+  };
+
   const handleAskHub = async () => {
     if (!isPremium) {
       router.push('/paywall');
@@ -86,10 +116,10 @@ export default function HomeScreen() {
     setIsAskingHub(true);
     setHubAnswer(null);
     try {
-      const answer = await askGlobal(hubQuestion.trim());
+      const { answer } = await askGlobal(hubQuestion.trim());
       setHubAnswer(answer);
     } catch (e: any) {
-      Alert.alert('AI Hub Error', e.message);
+      showError(e, 'Assistant unavailable', "The assistant couldn't answer that right now. Please try again in a moment.");
     } finally {
       setIsAskingHub(false);
     }
@@ -101,6 +131,7 @@ export default function HomeScreen() {
       if (result.canceled || result.assets.length === 0) return;
       
       const file = result.assets[0];
+      await AsyncStorage.removeItem('@last_upload_id');
       router.replace('/processing/pending');
 
       const formData = new FormData();
@@ -113,14 +144,18 @@ export default function HomeScreen() {
       } as any);
 
       const token = await AsyncStorage.getItem('@auth_token');
-      await fetch(API_BASE_URL, {
+      const res = await fetch(API_BASE_URL, {
         method: 'POST',
         body: formData,
-        headers: { 
+        headers: {
           'Content-Type': 'multipart/form-data',
           'Authorization': `Bearer ${token}`
         },
       });
+      const data = await res.json().catch(() => null);
+      if (data?.meeting?._id) {
+        await AsyncStorage.setItem('@last_upload_id', String(data.meeting._id));
+      }
     } catch (e) {
       Alert.alert('Upload Error', 'Could not import audio file.');
     }
@@ -128,8 +163,8 @@ export default function HomeScreen() {
 
   useFocusEffect(
     useCallback(() => {
-      loadData();
-    }, [])
+      loadData(meetings.length === 0);
+    }, [meetings.length])
   );
 
   const onRefresh = async () => {
@@ -138,17 +173,46 @@ export default function HomeScreen() {
     setRefreshing(false);
   };
 
-  const handleLogout = () => {
-    Alert.alert('Sign Out', 'Are you sure you want to sign out?', [
-      { text: 'Cancel', style: 'cancel' },
-      { text: 'Sign Out', style: 'destructive', onPress: signOut }
-    ]);
-  };
-
   const recentMeetings = meetings.slice(0, 3);
+  const hour = new Date().getHours();
+  const greeting = hour < 12 ? 'Good morning' : hour < 18 ? 'Good afternoon' : 'Good evening';
+
+  // Last 7 days of recorded hours, oldest → today, plus the week-over-week delta.
+  const pulse = useMemo(() => {
+    const dayMs = 86400000;
+    const startOfToday = new Date();
+    startOfToday.setHours(0, 0, 0, 0);
+
+    const hoursOnDay = (offset: number) => {
+      const from = startOfToday.getTime() - offset * dayMs;
+      const to = from + dayMs;
+      const secs = meetings.reduce((acc, m) => {
+        const t = new Date(m.date).getTime();
+        return t >= from && t < to ? acc + (m.duration || 0) : acc;
+      }, 0);
+      return secs / 3600;
+    };
+
+    const days = Array.from({ length: 7 }, (_, i) => {
+      const offset = 6 - i;
+      const date = new Date(startOfToday.getTime() - offset * dayMs);
+      return {
+        hours: hoursOnDay(offset),
+        initial: date.toLocaleDateString(undefined, { weekday: 'narrow' }),
+        isToday: offset === 0,
+      };
+    });
+
+    const thisWeek = days.reduce((a, d) => a + d.hours, 0);
+    const prevWeek = Array.from({ length: 7 }, (_, i) => hoursOnDay(7 + i)).reduce((a, h) => a + h, 0);
+    const delta = prevWeek > 0 ? Math.round(((thisWeek - prevWeek) / prevWeek) * 100) : null;
+
+    return { days, peak: Math.max(...days.map(d => d.hours), 0.5), delta };
+  }, [meetings]);
 
   return (
     <View style={[styles.container, { backgroundColor: themeColors.bg }]}>
+      <Aurora isDark={isDarkMode} variant="home" />
       <SafeAreaView style={{ flex: 1 }} edges={['top']}>
         {isLoading ? (
           <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
@@ -160,268 +224,316 @@ export default function HomeScreen() {
               <Skeleton width={44} height={44} radius={22} />
             </View>
             <View style={styles.section}>
-              <Skeleton width="100%" height={160} radius={24} />
-            </View>
-            <View style={styles.statsContainer}>
-              <Skeleton width="30%" height={100} radius={20} />
-              <Skeleton width="30%" height={100} radius={20} />
-              <Skeleton width="30%" height={100} radius={20} />
+              <Skeleton width="100%" height={56} radius={22} />
             </View>
             <View style={styles.section}>
-              <Skeleton width="100%" height={200} radius={24} />
+              <Skeleton width={140} height={20} style={{ marginBottom: 12 }} />
+              <Skeleton width="100%" height={140} radius={24} />
+            </View>
+            <View style={styles.section}>
+              <Skeleton width={140} height={20} style={{ marginBottom: 12 }} />
+              <Skeleton width="100%" height={180} radius={24} />
             </View>
           </ScrollView>
         ) : (
           <ScrollView 
             contentContainerStyle={styles.scrollContent} 
             showsVerticalScrollIndicator={false}
+            removeClippedSubviews={true}
+            scrollEventThrottle={16}
             refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={themeColors.primary} />}
           >
             {/* Header */}
-            <View style={styles.header}>
-              <View>
-                <Text style={styles.greeting}>Hi, {user?.name?.split(' ')[0] || 'User'}</Text>
-                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginTop: 2 }}>
-                  <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: isOffline ? '#FF3B30' : '#30D158' }} />
-                  <Text style={[styles.subtitle, { color: isOffline ? '#FF3B30' : '#30D158', fontWeight: '800', fontSize: 10 }]}>{isOffline ? 'OFFLINE' : 'LIVE'}</Text>
-                  <Text style={styles.subtitle}>• {meetings.length} recordings</Text>
-                  {isPremium && <Badge label="PRO" color={themeColors.primary} bg={themeColors.primary + '15'} />}
-                </View>
+            <View style={[styles.header, { marginBottom: 14 }]}>
+              <View style={{ flex: 1 }}>
+                <Text style={{ color: themeColors.textMuted, fontWeight: '700', fontSize: 12, letterSpacing: 0.3 }}>
+                  {greeting} · {new Date().toLocaleDateString(undefined, { weekday: 'long', month: 'short', day: 'numeric' })}
+                </Text>
+                <Text style={[styles.greeting, { fontSize: 30, fontWeight: '800', letterSpacing: -0.8, marginTop: 3 }]} numberOfLines={1}>
+                  {user?.name?.split(' ')[0] || 'there'}
+                </Text>
               </View>
 
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
-                <TouchableOpacity 
-                  onPress={pickAndUploadAudio}
-                  style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: themeColors.bgCard, borderWidth: 1, borderColor: themeColors.border, alignItems: 'center', justifyContent: 'center' }}
+              <TouchableOpacity onPress={() => router.push('/(tabs)/settings')} activeOpacity={0.8}>
+                <LinearGradient
+                  colors={themeColors.gradientPrimary as [string, string]}
+                  start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }}
+                  style={{ width: 44, height: 44, borderRadius: 14, alignItems: 'center', justifyContent: 'center', shadowColor: themeColors.primary, shadowOpacity: 0.4, shadowRadius: 10, shadowOffset: { width: 0, height: 4 } }}
                 >
-                  <Feather name="upload" size={20} color={themeColors.primary} />
-                </TouchableOpacity>
-                <TouchableOpacity style={styles.avatarContainer} onPress={handleLogout}>
-                  <LinearGradient colors={themeColors.gradientAccent as any} style={styles.avatarGradient}>
-                    <Text style={styles.avatarText}>{user?.name?.charAt(0).toUpperCase() || 'U'}</Text>
+                  <Text style={{ color: '#fff', fontWeight: '800', fontSize: 17 }}>{user?.name?.charAt(0).toUpperCase() || 'U'}</Text>
+                </LinearGradient>
+              </TouchableOpacity>
+            </View>
+
+            {/* 1 · NOW — the only time-sensitive thing on the screen */}
+            {upcomingEvent && (
+              <View style={styles.section}>
+                <SectionHeader title="Up Next" />
+                <TouchableOpacity onPress={handleOpenBriefing} disabled={loadingBriefing}>
+                  <LinearGradient
+                    colors={[themeColors.primary + '15', 'transparent']}
+                    style={{ padding: 18, borderRadius: 24, borderWidth: 1, borderColor: themeColors.primary + '20' }}
+                  >
+                    <View style={{ flexDirection: 'row', gap: 15, alignItems: 'center' }}>
+                      <View style={{ width: 44, height: 44, borderRadius: 14, backgroundColor: themeColors.primary, alignItems: 'center', justifyContent: 'center' }}>
+                        <Feather name="calendar" size={22} color="#fff" />
+                      </View>
+                      <View style={{ flex: 1 }}>
+                        <Text style={{ color: themeColors.textPrimary, fontSize: 16, fontWeight: '700' }}>{upcomingEvent.title}</Text>
+                        <Text style={{ color: themeColors.textSecondary, fontSize: 12, marginTop: 2 }}>
+                          Commencing at {new Date(upcomingEvent.startDate).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                        </Text>
+                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 6 }}>
+                          <Feather name="zap" size={11} color={themeColors.primary} />
+                          <Text style={{ color: themeColors.primary, fontSize: 11, fontWeight: '800' }}>Tap for AI briefing</Text>
+                        </View>
+                      </View>
+                      {loadingBriefing
+                        ? <ActivityIndicator size="small" color={themeColors.primary} />
+                        : <Feather name="chevron-right" size={18} color={themeColors.textMuted} />}
+                    </View>
                   </LinearGradient>
                 </TouchableOpacity>
               </View>
-            </View>
-
-            {/* Smart Proactive Section */}
-            {isPremium && upcomingEvent && (
-              <View style={styles.section}>
-                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-                  <Text style={styles.sectionTitle}>Up Next</Text>
-                  <Badge label="Prep Mode" color={themeColors.success} bg={themeColors.success + '15'} />
-                </View>
-                <GlassCard style={{ padding: 18, borderColor: themeColors.success + '30', backgroundColor: themeColors.success + '05' }}>
-                  <View style={{ flexDirection: 'row', gap: 15, alignItems: 'center' }}>
-                    <View style={{ width: 44, height: 44, borderRadius: 22, backgroundColor: themeColors.success + '20', alignItems: 'center', justifyContent: 'center' }}>
-                      <Feather name="calendar" size={22} color={themeColors.success} />
-                    </View>
-                    <View style={{ flex: 1 }}>
-                      <Text style={{ color: themeColors.textPrimary, fontSize: 16, fontWeight: '700' }}>{upcomingEvent.title}</Text>
-                      <Text style={{ color: themeColors.textSecondary, fontSize: 13, marginTop: 2 }}>
-                        Starts at {new Date(upcomingEvent.startDate).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
-                      </Text>
-                    </View>
-                  </View>
-                  <Divider style={{ marginVertical: 15, opacity: 0.3 }} />
-                  <TouchableOpacity 
-                    style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}
-                    onPress={() => {
-                      if (proactive?.lastMeeting) {
-                        Alert.alert("Context from " + proactive.lastMeeting.title, proactive.lastMeeting.summary.slice(0, 200) + "...");
-                      } else {
-                        Alert.alert("No previous context", "We couldn't find a related previous meeting to prep you with.");
-                      }
-                    }}
-                  >
-                    <Feather name="zap" size={14} color={themeColors.success} />
-                    <Text style={{ color: themeColors.success, fontWeight: '700', fontSize: 13 }}>BRIEF ME ON LAST SESSION</Text>
-                  </TouchableOpacity>
-                </GlassCard>
-              </View>
             )}
 
-            {/* Daily Action Plan */}
+            {/* 2 · CAPTURE — the app's core job, both entry points together */}
+            <View style={styles.section}>
+              <TouchableOpacity
+                activeOpacity={0.85}
+                onPress={() => { Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium); router.push('/record'); }}
+                style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, backgroundColor: themeColors.textPrimary, borderRadius: 22, paddingVertical: 17 }}
+              >
+                <View style={{ width: 26, height: 26, borderRadius: 13, backgroundColor: themeColors.danger, alignItems: 'center', justifyContent: 'center' }}>
+                  <Feather name="mic" size={15} color="#fff" />
+                </View>
+                <Text style={{ color: themeColors.bg, fontSize: 16, fontWeight: '800' }}>Start New Recording</Text>
+              </TouchableOpacity>
+
+              <TouchableOpacity
+                activeOpacity={0.85}
+                onPress={pickAndUploadAudio}
+                style={{ marginTop: 10, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, borderRadius: 22, paddingVertical: 15, borderWidth: 1, borderColor: themeColors.border, backgroundColor: isDarkMode ? 'rgba(255,255,255,0.04)' : 'rgba(0,0,0,0.02)' }}
+              >
+                <Feather name="upload" size={16} color={themeColors.textSecondary} />
+                <Text style={{ color: themeColors.textSecondary, fontSize: 14, fontWeight: '700' }}>Import audio file</Text>
+              </TouchableOpacity>
+            </View>
+
+            {/* 3 · ACT — what needs doing, pulled out of the tasks board */}
             {proactive && proactive.tasks.length > 0 && (
               <View style={styles.section}>
-                <Text style={styles.sectionTitle}>Daily Action Plan</Text>
-                <GlassCard style={{ padding: 16, marginTop: 12 }}>
-                  {proactive.tasks.map((task, idx) => (
-                    <TouchableOpacity 
-                      key={task._id} 
-                      style={[{ flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 10 }, idx !== proactive.tasks.length - 1 && { borderBottomWidth: 1, borderBottomColor: themeColors.border }]}
+                <SectionHeader
+                  title="Priority Focus"
+                  action={{ label: 'View Board', onPress: () => router.push('/(tabs)/tasks') }}
+                />
+                <GlassCard style={{ padding: 16, borderRadius: 24 }}>
+                  {proactive.tasks.slice(0, 3).map((task, idx, arr) => (
+                    <TouchableOpacity
+                      key={task._id}
+                      style={[{ flexDirection: 'row', alignItems: 'center', gap: 12, paddingVertical: 12 }, idx !== arr.length - 1 && { borderBottomWidth: 1, borderBottomColor: themeColors.border }]}
                       onPress={() => router.push(`/meeting/${task.meetingId}`)}
                     >
-                      <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: task.priority === 'high' ? themeColors.danger : themeColors.warning }} />
+                      <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: task.priority === 'high' ? themeColors.danger : themeColors.warning }} />
                       <View style={{ flex: 1 }}>
                         <Text style={{ color: themeColors.textPrimary, fontSize: 14, fontWeight: '600' }} numberOfLines={1}>{task.title}</Text>
                         <Text style={{ color: themeColors.textMuted, fontSize: 11, marginTop: 2 }}>{task.meetingTitle}</Text>
                       </View>
-                      <Feather name="chevron-right" size={14} color={themeColors.textMuted} />
+                      <Feather name="arrow-right" size={14} color={themeColors.textMuted} />
                     </TouchableOpacity>
                   ))}
                 </GlassCard>
               </View>
             )}
 
-            {/* AI Hub Section */}
+            {/* 4 · ASK — the two ways to interrogate past meetings, side by side */}
             <View style={styles.section}>
-              <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-                <Text style={styles.sectionTitle}>AI Hub</Text>
-                <Badge label="Premium" color={themeColors.accent} bg={themeColors.accent + '15'} />
-              </View>
-              <GlassCard style={{ padding: 16 }}>
-                <Text style={{ color: themeColors.textSecondary, fontSize: 13, marginBottom: 12 }}>Ask questions across all your recent meetings.</Text>
+              <SectionHeader title="Intelligence" />
+              <GlassCard style={{ padding: 16, borderRadius: 24, backgroundColor: themeColors.bgCard }}>
                 <View style={{ flexDirection: 'row', gap: 10 }}>
-                  <TextInput 
-                    style={{ flex: 1, backgroundColor: 'rgba(255,255,255,0.05)', borderRadius: 12, paddingHorizontal: 12, color: themeColors.textPrimary, fontSize: 14, height: 44 }} 
-                    placeholder="What was discussed about budget?" 
+                  <TextInput
+                    style={{ flex: 1, backgroundColor: isDarkMode ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)', borderRadius: 14, paddingHorizontal: 16, color: themeColors.textPrimary, fontSize: 14, height: 48 }}
+                    placeholder="Ask across all your meetings..."
                     placeholderTextColor={themeColors.textMuted}
                     value={hubQuestion}
                     onChangeText={setHubQuestion}
+                    onSubmitEditing={handleAskHub}
+                    returnKeyType="search"
                   />
-                  <TouchableOpacity 
+                  <TouchableOpacity
                     onPress={handleAskHub}
                     disabled={isAskingHub}
-                    style={{ width: 44, height: 44, borderRadius: 12, backgroundColor: isPremium ? themeColors.primary : 'rgba(255,255,255,0.1)', alignItems: 'center', justifyContent: 'center', overflow: 'hidden' }}
+                    style={{ width: 48, height: 48, borderRadius: 14, backgroundColor: themeColors.primary, alignItems: 'center', justifyContent: 'center' }}
                   >
                     {isAskingHub ? (
-                      <LottieView source={{ uri: 'https://assets10.lottiefiles.com/packages/lf20_S69rU8.json' }} autoPlay loop style={{ width: 40, height: 40 }} />
+                      <ActivityIndicator color="#fff" size="small" />
                     ) : (
-                      <Feather name={isPremium ? "zap" : "lock"} size={20} color={isPremium ? "#fff" : themeColors.textMuted} />
+                      <Feather name="zap" size={20} color="#fff" />
                     )}
                   </TouchableOpacity>
                 </View>
                 {hubAnswer && (
-                  <View style={{ marginTop: 16, padding: 12, backgroundColor: 'rgba(255,255,255,0.03)', borderRadius: 12, borderWidth: 1, borderColor: 'rgba(255,255,255,0.05)' }}>
-                    <Text style={{ color: themeColors.textPrimary, fontSize: 14, lineHeight: 20 }}>{hubAnswer}</Text>
-                    <TouchableOpacity onPress={() => setHubAnswer(null)} style={{ alignSelf: 'flex-end', marginTop: 8 }}>
-                      <Text style={{ color: themeColors.textMuted, fontSize: 11, fontWeight: '700' }}>DISMISS</Text>
+                  <View style={{ marginTop: 16, padding: 14, backgroundColor: themeColors.primary + '08', borderRadius: 16, borderLeftWidth: 3, borderLeftColor: themeColors.primary }}>
+                    <Text style={{ color: themeColors.textPrimary, fontSize: 14, lineHeight: 22 }}>{hubAnswer}</Text>
+                    <TouchableOpacity onPress={() => setHubAnswer(null)} style={{ alignSelf: 'flex-end', marginTop: 10 }}>
+                      <Text style={{ color: themeColors.textMuted, fontSize: 10, fontWeight: '800' }}>DISMISS</Text>
                     </TouchableOpacity>
                   </View>
                 )}
+
+                <Divider style={{ marginVertical: 16 }} />
+
+                <TouchableOpacity onPress={() => router.push('/memory')} activeOpacity={0.7} style={{ flexDirection: 'row', alignItems: 'center', gap: 14 }}>
+                  <View style={{ width: 44, height: 44, borderRadius: 14, backgroundColor: themeColors.primary + '15', alignItems: 'center', justifyContent: 'center' }}>
+                    <Feather name="cpu" size={22} color={themeColors.primary} />
+                  </View>
+                  <View style={{ flex: 1 }}>
+                    <Text style={{ color: themeColors.textPrimary, fontSize: 15, fontWeight: '700' }}>Memory</Text>
+                    <Text style={{ color: themeColors.textMuted, fontSize: 12, marginTop: 2 }}>Timelines, open commitments & decision drift</Text>
+                  </View>
+                  <Feather name="chevron-right" size={18} color={themeColors.textMuted} />
+                </TouchableOpacity>
               </GlassCard>
             </View>
 
-            {/* Stats Grid */}
+            {/* 5 · REVIEW — retrospective stats, then the archive they summarize */}
             <View style={styles.section}>
-              <View style={styles.statsContainer}>
-                <View style={styles.statCard}>
-                  <View style={[styles.statIcon, { backgroundColor: 'rgba(0,122,255,0.1)' }]}>
-                    <Feather name="mic" size={18} color={themeColors.primary} />
-                  </View>
-                  <Text style={styles.statValue}>{analytics?.summary.totalMeetings || 0}</Text>
-                  <Text style={styles.statLabel}>Total</Text>
-                </View>
-                <View style={styles.statCard}>
-                  <View style={[styles.statIcon, { backgroundColor: 'rgba(48,209,88,0.1)' }]}>
-                    <Feather name="check-square" size={18} color={themeColors.success} />
-                  </View>
-                  <Text style={styles.statValue}>{analytics?.summary.totalTasks || 0}</Text>
-                  <Text style={styles.statLabel}>Tasks</Text>
-                </View>
-                <View style={styles.statCard}>
-                  <View style={[styles.statIcon, { backgroundColor: 'rgba(255,159,10,0.1)' }]}>
-                    <Feather name="clock" size={18} color={themeColors.warning} />
-                  </View>
-                  <Text style={styles.statValue}>{analytics?.summary.totalHours || '0.0'}h</Text>
-                  <Text style={styles.statLabel}>Hours</Text>
-                </View>
-              </View>
-            </View>
+              <SectionHeader title="This Week" />
+              <LinearGradient
+                colors={['#0A84FF', '#5B54E8']}
+                start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }}
+                style={{ borderRadius: 28, padding: 20, overflow: 'hidden', shadowColor: '#0A84FF', shadowOpacity: 0.3, shadowRadius: 20, shadowOffset: { width: 0, height: 10 } }}
+              >
+                <View pointerEvents="none" style={{ position: 'absolute', top: -70, right: -50, width: 190, height: 190, borderRadius: 95, backgroundColor: 'rgba(255,255,255,0.10)' }} />
 
-            {/* Analytics Dashboard */}
-            <View style={styles.section}>
-              <View style={styles.analyticsCard}>
-                <Text style={styles.analyticsTitle}>Meeting Insights</Text>
-                
-                <View style={styles.progressRow}>
-                  <Text style={styles.progressLabel}>Task Completion</Text>
-                  <Text style={styles.progressValue}>{analytics?.summary.completionRate || 0}%</Text>
-                </View>
-                <View style={styles.progressBarBg}>
-                  <View 
-                    style={[
-                      styles.progressBarFill, 
-                      { width: `${analytics?.summary.completionRate || 0}%` }
-                    ]} 
-                  />
-                </View>
-
-                <Text style={[styles.progressLabel, { marginBottom: 12 }]}>Top Topics</Text>
-                <View style={styles.topicRow}>
-                  {analytics?.topTags.map(tag => (
-                    <View key={tag.name} style={styles.topicChip}>
-                      <Text style={styles.topicName}>{tag.name}</Text>
-                      <Text style={styles.topicCount}>{tag.count}</Text>
+                {/* Headline: hours focused, with week-over-week change */}
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                  <View>
+                    <Text style={{ color: 'rgba(255,255,255,0.75)', fontWeight: '800', fontSize: 10, letterSpacing: 1.2 }}>HOURS FOCUSED</Text>
+                    <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 5, marginTop: 6 }}>
+                      <Text style={{ color: '#fff', fontSize: 46, fontWeight: '800', letterSpacing: -2, lineHeight: 50 }}>{analytics?.summary.totalHours || '0.0'}</Text>
+                      <Text style={{ color: 'rgba(255,255,255,0.7)', fontSize: 15, fontWeight: '700', marginBottom: 8 }}>this week</Text>
                     </View>
-                  ))}
-                  {(!analytics?.topTags || analytics.topTags.length === 0) && (
-                    <Text style={{ color: themeColors.textMuted, fontSize: 12 }}>Record more sessions to see trends</Text>
+                  </View>
+                  {pulse.delta !== null && (
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 3, backgroundColor: 'rgba(255,255,255,0.18)', paddingHorizontal: 8, paddingVertical: 5, borderRadius: 10, marginTop: 2 }}>
+                      <Feather name={pulse.delta >= 0 ? 'trending-up' : 'trending-down'} size={12} color="#fff" />
+                      <Text style={{ color: '#fff', fontSize: 11, fontWeight: '800' }}>{Math.abs(pulse.delta)}%</Text>
+                    </View>
                   )}
                 </View>
-              </View>
-            </View>
 
-            {/* Recent Feed */}
-            <View style={styles.section}>
-              <SectionHeader 
-                title="Recent Sessions" 
-                action={{ label: 'View All', onPress: () => router.push('/(tabs)/history') }} 
-              />
-              {recentMeetings.length === 0 ? (
-                <GlassCard style={{ padding: 40, alignItems: 'center' }}>
-                  <Feather name="file-text" size={32} color={themeColors.textMuted} />
-                  <Text style={{ color: themeColors.textMuted, marginTop: 12 }}>No recordings yet</Text>
-                </GlassCard>
-              ) : (
-                recentMeetings.map((meeting) => (
-                  <GlassCard 
-                    key={meeting._id} 
-                    style={styles.recentCard}
-                    onPress={() => router.push(`/meeting/${meeting._id}`)}
-                  >
-                    <View style={styles.recentHeader}>
-                      <View style={styles.recentIcon}>
-                        <Feather 
-                          name={meeting.status === 'processing' ? 'refresh-cw' : 'file-text'} 
-                          size={20} 
-                          color={meeting.status === 'processing' ? themeColors.warning : themeColors.primaryLight} 
+                {/* Last 7 days — one bar per day, today called out */}
+                <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 6, height: 56 }}>
+                  {pulse.days.map((d, i) => (
+                    <View key={i} style={{ flex: 1, alignItems: 'center', gap: 6 }}>
+                      <View style={{ flex: 1, width: '100%', justifyContent: 'flex-end' }}>
+                        <View
+                          style={{
+                            height: `${Math.max((d.hours / pulse.peak) * 100, 4)}%`,
+                            borderRadius: 4,
+                            backgroundColor: d.isToday ? '#fff' : 'rgba(255,255,255,0.35)',
+                          }}
                         />
                       </View>
-                      <View style={styles.recentInfo}>
-                        <Text style={styles.recentTitle} numberOfLines={1}>{meeting.title}</Text>
-                        <Text style={styles.recentMeta}>
-                          {new Date(meeting.date).toLocaleDateString()} • {Math.round(meeting.duration / 60)} min
-                        </Text>
-                      </View>
-                      {meeting.status === 'processing' && (
-                        <Badge label="Processing" color={themeColors.warning} bg={themeColors.warning + '15'} />
-                      )}
+                      <Text style={{ color: d.isToday ? '#fff' : 'rgba(255,255,255,0.6)', fontSize: 9, fontWeight: '800' }}>{d.initial}</Text>
                     </View>
-                  </GlassCard>
-                ))
-              )}
-            </View>
-
-            {/* Pro Tip */}
-            <View style={styles.section}>
-              <LinearGradient 
-                colors={isDarkMode ? ['#1C1C1E', '#000'] : ['#E5E5EA', '#FFFFFF']} 
-                style={styles.tipCard}
-                start={{x:0, y:0}} end={{x:1, y:1}}
-              >
-                <View style={[styles.tipIcon, { backgroundColor: themeColors.primary + '15' }]}>
-                  <Feather name="zap" size={24} color={themeColors.primary} />
+                  ))}
                 </View>
-                <View style={{ flex: 1 }}>
-                  <Text style={[styles.tipTitle, { color: themeColors.textPrimary }]}>Smart Export</Text>
-                  <Text style={[styles.tipText, { color: themeColors.textSecondary }]}>
-                    Sync your tasks directly to your calendar or Notion workspace.
-                  </Text>
+
+                <View style={{ height: 1, backgroundColor: 'rgba(255,255,255,0.18)', marginTop: 18, marginBottom: 14 }} />
+
+                {/* Supporting counts */}
+                <View style={{ flexDirection: 'row' }}>
+                  {[
+                    { label: 'Sessions', value: String(meetings.length) },
+                    { label: 'Actions', value: String(analytics?.summary.totalTasks ?? 0) },
+                    { label: 'Completed', value: `${analytics?.summary.completionRate || 0}%` },
+                  ].map((s, i) => (
+                    <View key={s.label} style={{ flex: 1, borderLeftWidth: i === 0 ? 0 : 1, borderLeftColor: 'rgba(255,255,255,0.18)', paddingLeft: i === 0 ? 0 : 14 }}>
+                      <Text style={{ color: '#fff', fontWeight: '800', fontSize: 19 }}>{s.value}</Text>
+                      <Text style={{ color: 'rgba(255,255,255,0.7)', fontWeight: '700', fontSize: 10, marginTop: 2, textTransform: 'uppercase', letterSpacing: 0.5 }}>{s.label}</Text>
+                    </View>
+                  ))}
                 </View>
               </LinearGradient>
             </View>
+
+            <View style={[styles.section, { marginBottom: 30 }]}>
+              <SectionHeader
+                title="Recent Sessions"
+                action={{ label: 'View All', onPress: () => router.push('/(tabs)/history') }}
+              />
+              {recentMeetings.length === 0 ? (
+                <GlassCard style={{ padding: 32, alignItems: 'center', borderRadius: 24 }}>
+                  <View style={{ width: 56, height: 56, borderRadius: 18, backgroundColor: themeColors.primary + '12', alignItems: 'center', justifyContent: 'center' }}>
+                    <Feather name="layers" size={26} color={themeColors.primary} />
+                  </View>
+                  <Text style={{ color: themeColors.textPrimary, marginTop: 14, fontSize: 15, fontWeight: '700' }}>No sessions yet</Text>
+                  <Text style={{ color: themeColors.textMuted, marginTop: 4, fontSize: 13, textAlign: 'center', lineHeight: 19 }}>
+                    Record or import a meeting and it will show up here, summarized.
+                  </Text>
+                </GlassCard>
+              ) : (
+                recentMeetings.map((meeting) => {
+                  const processing = meeting.status === 'processing';
+                  const errored = meeting.status === 'error';
+                  const accent = processing ? themeColors.warning : errored ? themeColors.danger : themeColors.primary;
+                  return (
+                    <GlassCard
+                      key={meeting._id}
+                      style={[styles.recentCard, { borderRadius: 20, padding: 14, borderLeftWidth: 3, borderLeftColor: accent }]}
+                      onPress={() => router.push(`/meeting/${meeting._id}`)}
+                    >
+                      <View style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 12 }}>
+                        <View style={{ width: 40, height: 40, borderRadius: 13, backgroundColor: accent + '18', alignItems: 'center', justifyContent: 'center' }}>
+                          <Feather
+                            name={processing ? 'loader' : errored ? 'alert-circle' : 'file-text'}
+                            size={18}
+                            color={accent}
+                          />
+                        </View>
+
+                        <View style={{ flex: 1 }}>
+                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+                            <Text style={[styles.recentTitle, { flex: 1, fontWeight: '700' }]} numberOfLines={1}>{meeting.title}</Text>
+                            {processing
+                              ? <Badge label="Processing" color={themeColors.warning} bg={themeColors.warning + '15'} />
+                              : errored
+                                ? <Badge label="Failed" color={themeColors.danger} bg={themeColors.danger + '15'} />
+                                : <Feather name="chevron-right" size={16} color={themeColors.textMuted} />}
+                          </View>
+
+                          <Text style={styles.recentMeta}>
+                            {new Date(meeting.date).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })} • {Math.round((meeting.duration || 0) / 60)} min
+                          </Text>
+
+                          {meeting.status === 'ready' && !!meeting.summary && (
+                            <Text style={{ color: themeColors.textSecondary, fontSize: 12, lineHeight: 18, marginTop: 8 }} numberOfLines={2}>
+                              {meeting.summary}
+                            </Text>
+                          )}
+
+                          {meeting.status === 'ready' && (
+                            <View style={{ flexDirection: 'row', gap: 14, marginTop: 10 }}>
+                              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5 }}>
+                                <Feather name="check-square" size={12} color={themeColors.textMuted} />
+                                <Text style={{ color: themeColors.textMuted, fontSize: 11, fontWeight: '700' }}>{meeting.tasks?.length || 0} tasks</Text>
+                              </View>
+                              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 5 }}>
+                                <Feather name="zap" size={12} color={themeColors.textMuted} />
+                                <Text style={{ color: themeColors.textMuted, fontSize: 11, fontWeight: '700' }}>{meeting.decisions?.length || 0} decisions</Text>
+                              </View>
+                            </View>
+                          )}
+                        </View>
+                      </View>
+                    </GlassCard>
+                  );
+                })
+              )}
+            </View>
+
           </ScrollView>
         )}
       </SafeAreaView>

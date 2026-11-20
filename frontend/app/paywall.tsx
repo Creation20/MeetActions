@@ -11,23 +11,33 @@ import { GlassCard, GradientButton } from '../src/components/ui';
 
 export default function PaywallScreen() {
   const router = useRouter();
-  const { setPremiumStatus } = useAuth();
+  const { refreshEntitlement } = useAuth();
   const { isDarkMode, colors: themeColors } = useTheme();
   const [selectedPlan, setSelectedPlan] = useState<'monthly' | 'yearly'>('yearly');
   const [loading, setLoading] = useState(false);
 
+  /**
+   * There is no payment provider wired up yet, and premium is now enforced on the
+   * server. Faking a successful purchase here would flip the UI to Pro while every
+   * premium request kept failing — and telling a user "your subscription was
+   * successful" when no money moved and nothing unlocked is not something we ship.
+   *
+   * When IAP/RevenueCat lands: verify the receipt server-side, have the server set
+   * the entitlement, then call refreshEntitlement() to pull it down.
+   */
   const handleSubscribe = async () => {
     setLoading(true);
-    // Simulate payment processing
-    setTimeout(async () => {
-      await setPremiumStatus(true);
-      setLoading(false);
+    try {
+      // In case the entitlement was granted elsewhere (e.g. support), pick it up.
+      await refreshEntitlement();
       Alert.alert(
-        "Welcome to Pro!",
-        "Your subscription was successful. All premium features are now unlocked.",
-        [{ text: "Awesome", onPress: () => router.back() }]
+        'Not available yet',
+        "MeetActions Pro isn't open for purchase yet. We'll let you know the moment it is.",
+        [{ text: 'OK', onPress: () => router.back() }]
       );
-    }, 2000);
+    } finally {
+      setLoading(false);
+    }
   };
 
   const features = [

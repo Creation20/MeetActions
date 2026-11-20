@@ -10,6 +10,7 @@ import { useTheme } from '../../src/context/ThemeContext';
 import { getSignupStyles } from '../../src/styles/signup.styles';
 import * as WebBrowser from 'expo-web-browser';
 import * as Google from 'expo-auth-session/providers/google';
+import { showError } from '../../src/utils/errors';
 
 WebBrowser.maybeCompleteAuthSession();
 
@@ -44,7 +45,7 @@ export default function SignupScreen() {
       await signIn(res.token, res.user);
       router.replace('/onboarding');
     } catch (error: any) {
-      Alert.alert('Signup Failed', error.message);
+      showError(error, 'Sign-up failed', "We couldn't create your account. Please try again.");
     } finally {
       setLoading(false);
     }
@@ -62,7 +63,7 @@ export default function SignupScreen() {
       await signIn(res.token, res.user);
       router.replace('/onboarding');
     } catch (error: any) {
-      Alert.alert('Registration Failed', error.message);
+      showError(error, 'Sign-up failed', "We couldn't create your account. Please try again.");
     } finally {
       setLoading(false);
     }

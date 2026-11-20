@@ -7,10 +7,14 @@ import { Colors, FontSize, FontWeight, Radii, Spacing, Shadow } from '../../src/
 import { GlassCard, Badge } from '../../src/components/ui';
 import { useAuth } from '../../src/context/AuthContext';
 import { useTheme } from '../../src/context/ThemeContext';
-import { fetchAnalytics, AnalyticsData, deleteAccount, API_HOST } from '../../src/services/api';
+import { fetchAnalytics, AnalyticsData, deleteAccount, API_HOST, updateProfile } from '../../src/services/api';
 import { getSettingsStyles } from '../../src/styles/settings.styles';
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { LinearGradient } from 'expo-linear-gradient';
+import { Aurora } from '../../src/components/Aurora';
+import * as ImagePicker from 'expo-image-picker';
+import { Image } from 'react-native';
+import { showError } from '../../src/utils/errors';
 
 type ModalType = 'profile' | 'usage' | 'privacy' | 'faq' | 'about' | 'feedback' | 'sync' | null;
 
@@ -24,7 +28,36 @@ export default function SettingsScreen() {
   const [notionWebhook, setNotionWebhook] = React.useState('');
   const [trelloWebhook, setTrelloWebhook] = React.useState('');
   
-  const { user, signOut, isPremium } = useAuth();
+  const { user, signOut, isPremium, updateUser } = useAuth();
+  const [editName, setEditName] = React.useState('');
+  const [editImage, setEditImage] = React.useState<string | null>(null);
+  const [isSavingProfile, setIsSavingProfile] = React.useState(false);
+
+  const openProfile = () => {
+    setEditName(user?.name || '');
+    setEditImage(null);
+    setActiveModal('profile');
+  };
+
+  const pickProfileImage = async () => {
+    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], allowsEditing: true, aspect: [1, 1], quality: 0.6 });
+    if (!result.canceled && result.assets.length > 0) setEditImage(result.assets[0].uri);
+  };
+
+  const handleSaveProfile = async () => {
+    if (!user?._id || !editName.trim()) return;
+    setIsSavingProfile(true);
+    try {
+      const res = await updateProfile(user._id, editName.trim(), undefined, undefined, editImage || undefined);
+      if (res?.user) updateUser({ ...user, ...res.user });
+      setActiveModal(null);
+      Alert.alert('Saved', 'Your profile has been updated.');
+    } catch (e: any) {
+      showError(e, 'Profile not saved', "We couldn't save your profile. Please try again.");
+    } finally {
+      setIsSavingProfile(false);
+    }
+  };
   const { isDarkMode, colors: themeColors, toggleTheme } = useTheme();
   const styles = React.useMemo(() => getSettingsStyles(isDarkMode), [isDarkMode]);
   const [analytics, setAnalytics] = React.useState<AnalyticsData | null>(null);
@@ -148,14 +181,38 @@ export default function SettingsScreen() {
     </TouchableOpacity>
   ), [isDarkMode, themeColors, styles]);
 
+  const SectionHeader = ({ icon, label, color }: { icon: string; label: string; color?: string }) => (
+    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, marginBottom: 10, marginTop: 20 }}>
+      <View style={{ width: 24, height: 24, borderRadius: 8, backgroundColor: (color || themeColors.primary) + '20', alignItems: 'center', justifyContent: 'center' }}>
+        <Feather name={icon as any} size={13} color={color || themeColors.primary} />
+      </View>
+      <Text style={{ fontSize: 13, fontWeight: '800', color: themeColors.textPrimary, letterSpacing: 0.3 }}>{label}</Text>
+    </View>
+  );
+
   return (
     <View style={styles.container}>
+      <Aurora isDark={isDarkMode} variant="home" />
       <SafeAreaView style={{ flex: 1 }} edges={['top']}>
         <View style={styles.header}>
-          <Text style={styles.title}>Settings</Text>
+          <Text style={[styles.title, { fontSize: 30, fontWeight: '800', letterSpacing: -0.8 }]}>Settings</Text>
         </View>
 
         <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
+          {/* Profile hero */}
+          <TouchableOpacity activeOpacity={0.85} onPress={openProfile} style={{ flexDirection: 'row', alignItems: 'center', gap: 14, backgroundColor: themeColors.bgCard, borderWidth: 1, borderColor: themeColors.border, borderRadius: 22, padding: 16, marginBottom: 16 }}>
+            <LinearGradient colors={themeColors.gradientPrimary as [string, string]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={{ width: 56, height: 56, borderRadius: 18, alignItems: 'center', justifyContent: 'center' }}>
+              <Text style={{ color: '#fff', fontWeight: '800', fontSize: 24 }}>{user?.name?.charAt(0).toUpperCase() || 'U'}</Text>
+            </LinearGradient>
+            <View style={{ flex: 1 }}>
+              <Text style={{ fontSize: 18, fontWeight: '800', color: themeColors.textPrimary }} numberOfLines={1}>{user?.name || 'User'}</Text>
+              <Text style={{ fontSize: 13, color: themeColors.textMuted }} numberOfLines={1}>{user?.email}</Text>
+            </View>
+            <View style={{ backgroundColor: (isPremium ? themeColors.success : themeColors.textMuted) + '20', paddingHorizontal: 10, paddingVertical: 4, borderRadius: 10 }}>
+              <Text style={{ fontSize: 10, fontWeight: '800', color: isPremium ? themeColors.success : themeColors.textMuted }}>{isPremium ? 'PRO' : 'FREE'}</Text>
+            </View>
+          </TouchableOpacity>
+
           {/* Subscription Card */}
           <LinearGradient
             colors={isPremium ? themeColors.gradientPrimary as any : (isDarkMode ? ['#1C1C1E', '#1C1C1E'] : ['#E5E5EA', '#E5E5EA'])}
@@ -181,7 +238,7 @@ export default function SettingsScreen() {
             </View>
           </LinearGradient>
 
-          <Text style={styles.sectionTitle}>Preferences</Text>
+          <SectionHeader icon="sliders" label="Preferences" />
           <GlassCard style={styles.card}>
             <SettingItem icon="moon" title="Dark Mode" subtitle="Adjust the app's appearance" type="toggle" value={isDarkMode} onValueChange={toggleTheme} />
             <View style={styles.divider} />
@@ -192,7 +249,7 @@ export default function SettingsScreen() {
             <SettingItem icon="bell" title="Task Reminders" type="toggle" value={notifications} onValueChange={handleToggleNotifications} />
           </GlassCard>
 
-          <Text style={styles.sectionTitle}>Integrations</Text>
+          <SectionHeader icon="grid" label="Integrations" />
           <GlassCard style={styles.card}>
             <View style={styles.settingItem}>
               <View style={[styles.iconWrap, { backgroundColor: '#4A154B15', borderColor: '#4A154B30' }]}><Feather name="slack" size={18} color="#4A154B" /></View>
@@ -223,16 +280,16 @@ export default function SettingsScreen() {
             </View>
           </GlassCard>
 
-          <Text style={styles.sectionTitle}>Account</Text>
+          <SectionHeader icon="user" label="Account" />
           <GlassCard style={styles.card}>
-            <SettingItem icon="user" title="Profile" subtitle={`${user?.name} • ${user?.email}`} type="link" onPress={() => setActiveModal('profile')} />
+            <SettingItem icon="user" title="Profile" subtitle={`${user?.name} • ${user?.email}`} type="link" onPress={openProfile} />
             <View style={styles.divider} />
             <SettingItem icon="pie-chart" title="Usage Statistics" subtitle={`${analytics?.summary.totalMeetings || 0} Recordings • ${analytics?.summary.totalTasks || 0} Action Items`} type="link" onPress={() => setActiveModal('usage')} />
             <View style={styles.divider} />
             <SettingItem icon="cloud" title="Backup & Sync" subtitle="Last synced: Today 10:45 AM" type="link" onPress={() => setActiveModal('sync')} />
           </GlassCard>
 
-          <Text style={styles.sectionTitle}>Support</Text>
+          <SectionHeader icon="life-buoy" label="Support" />
           <GlassCard style={styles.card}>
             <SettingItem icon="help-circle" title="Help Center & FAQ" type="link" onPress={() => setActiveModal('faq')} />
             <View style={styles.divider} />
@@ -245,7 +302,7 @@ export default function SettingsScreen() {
             <Text style={styles.logoutText}>Sign Out</Text>
           </TouchableOpacity>
 
-          <Text style={styles.sectionTitle}>Danger Zone</Text>
+          <SectionHeader icon="alert-triangle" label="Danger Zone" color={themeColors.danger} />
           <GlassCard style={[styles.card, { borderColor: '#FF3B3030' }]}>
             <TouchableOpacity 
               style={[styles.settingItem, { borderBottomWidth: 0 }]} 
@@ -283,17 +340,47 @@ export default function SettingsScreen() {
             <ScrollView showsVerticalScrollIndicator={false}>
               {activeModal === 'profile' && (
                 <View>
-                  <Text style={styles.modalTitle}>User Profile</Text>
-                  <View style={{ alignItems: 'center', marginBottom: 30 }}>
-                    <View style={{ width: 100, height: 100, borderRadius: 50, backgroundColor: themeColors.bgCard, alignItems: 'center', justifyContent: 'center', borderWidth: 2, borderColor: themeColors.primary }}>
-                      <Text style={{ fontSize: 40, fontWeight: 'bold', color: themeColors.textPrimary }}>{user?.name?.charAt(0)}</Text>
-                    </View>
+                  <Text style={styles.modalTitle}>Edit Profile</Text>
+
+                  {/* Tappable avatar */}
+                  <View style={{ alignItems: 'center', marginBottom: 26 }}>
+                    <TouchableOpacity onPress={pickProfileImage} activeOpacity={0.8}>
+                      {editImage ? (
+                        <Image source={{ uri: editImage }} style={{ width: 96, height: 96, borderRadius: 30 }} />
+                      ) : (
+                        <LinearGradient colors={themeColors.gradientPrimary as [string, string]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }} style={{ width: 96, height: 96, borderRadius: 30, alignItems: 'center', justifyContent: 'center' }}>
+                          <Text style={{ fontSize: 40, fontWeight: '800', color: '#fff' }}>{user?.name?.charAt(0).toUpperCase()}</Text>
+                        </LinearGradient>
+                      )}
+                      <View style={{ position: 'absolute', bottom: -2, right: -2, width: 32, height: 32, borderRadius: 16, backgroundColor: themeColors.primary, alignItems: 'center', justifyContent: 'center', borderWidth: 3, borderColor: themeColors.bgCard }}>
+                        <Feather name="camera" size={14} color="#fff" />
+                      </View>
+                    </TouchableOpacity>
+                    <Text style={{ color: themeColors.textMuted, fontSize: 12, marginTop: 10 }}>Tap to change photo</Text>
                   </View>
-                  <View style={{ gap: 20 }}>
-                    <View><Text style={{ color: themeColors.textMuted, fontSize: 12, marginBottom: 8, fontWeight: 'bold' }}>FULL NAME</Text><Text style={{ color: themeColors.textPrimary, fontSize: 18 }}>{user?.name}</Text></View>
-                    <View><Text style={{ color: themeColors.textMuted, fontSize: 12, marginBottom: 8, fontWeight: 'bold' }}>EMAIL ADDRESS</Text><Text style={{ color: themeColors.textPrimary, fontSize: 18 }}>{user?.email}</Text></View>
-                    <View><Text style={{ color: themeColors.textMuted, fontSize: 12, marginBottom: 8, fontWeight: 'bold' }}>MEMBER SINCE</Text><Text style={{ color: themeColors.textPrimary, fontSize: 18 }}>May 2026</Text></View>
+
+                  <Text style={{ color: themeColors.textMuted, fontSize: 11, marginBottom: 8, fontWeight: '800', letterSpacing: 1 }}>FULL NAME</Text>
+                  <TextInput
+                    style={styles.modalInput}
+                    value={editName}
+                    onChangeText={setEditName}
+                    placeholder="Your name"
+                    placeholderTextColor={themeColors.textMuted}
+                  />
+
+                  <Text style={{ color: themeColors.textMuted, fontSize: 11, marginBottom: 8, marginTop: 4, fontWeight: '800', letterSpacing: 1 }}>EMAIL ADDRESS</Text>
+                  <View style={[styles.modalInput, { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', opacity: 0.7 }]}>
+                    <Text style={{ color: themeColors.textPrimary, fontSize: 16 }}>{user?.email}</Text>
+                    <Feather name="lock" size={14} color={themeColors.textMuted} />
                   </View>
+
+                  <TouchableOpacity
+                    onPress={handleSaveProfile}
+                    disabled={isSavingProfile || !editName.trim()}
+                    style={{ height: 54, borderRadius: 16, marginTop: 12, alignItems: 'center', justifyContent: 'center', backgroundColor: themeColors.primary, opacity: (!editName.trim() || isSavingProfile) ? 0.6 : 1 }}
+                  >
+                    {isSavingProfile ? <ActivityIndicator color="#fff" /> : <Text style={{ color: '#fff', fontSize: 16, fontWeight: '800' }}>Save Changes</Text>}
+                  </TouchableOpacity>
                 </View>
               )}
 

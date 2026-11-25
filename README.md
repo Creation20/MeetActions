@@ -53,7 +53,7 @@ The project is divided into two main components:
 - **Animations:** Lottie React Native
 
 ## 📄 Documentation
-For a full list of every feature and technical detail, please refer to [APP_FEATURES.md](./APP_FEATURES.md).
+For a full list of every feature and technical detail, please refer to [APP_FEATURES.mdddd](./APP_FEATURES.md).
 
 ---
 **Developed by William Bentil**
